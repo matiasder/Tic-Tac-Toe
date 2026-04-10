@@ -1,0 +1,388 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+static const char *TAG = "tictactoe";
+
+#define FILA_0  13
+#define FILA_1  14
+#define FILA_2  16
+#define FILA_3  17
+#define FILA_4  18
+#define FILA_5  19
+
+#define COL_ROJO_0_1   21
+#define COL_ROJO_2_3   22
+#define COL_ROJO_4_5   23
+
+#define COL_VERDE_0_1  25
+#define COL_VERDE_2_3  26
+#define COL_VERDE_4_5  27
+
+#define BTN_AVANZAR   32
+#define BTN_CONFIRMAR 33
+
+#define NUM_COLUMNAS       3
+#define REFRESH_HZ         1500
+#define DEBOUNCE_MS        200
+#define TICKS_PARPADEO     2
+#define TICKS_ANIMACION    32
+
+typedef enum {
+    VACIA  = 0,
+    ROJO   = 1,
+    VERDE  = 2,
+} Jugador;
+
+typedef enum {
+    JUGANDO,
+    VICTORIA,
+    EMPATE,
+} EstadoJuego;
+
+typedef struct {
+    Jugador     tablero[9];
+    Jugador     turno;
+    int         cursor;
+    EstadoJuego estado;
+    Jugador     ganador;
+    bool        cursor_visible;
+    int         ticks_parpadeo;
+    int         ticks_animacion;
+} Juego;
+
+typedef enum {
+    EVENTO_AVANZAR,
+    EVENTO_CONFIRMAR,
+} EventoBoton;
+
+typedef struct {
+    int          gpio;
+    EventoBoton  evento;
+    uint32_t     ultimo_ms;
+} Boton;
+
+static volatile uint8_t frame_rojo[NUM_COLUMNAS];
+static volatile uint8_t frame_verde[NUM_COLUMNAS];
+
+static QueueHandle_t cola_botones;
+
+static Boton botones[] = {
+    {BTN_AVANZAR,   EVENTO_AVANZAR,   0},
+    {BTN_CONFIRMAR, EVENTO_CONFIRMAR, 0},
+};
+
+static const int pines_filas[6] = {
+    FILA_0, FILA_1, FILA_2, FILA_3, FILA_4, FILA_5
+};
+static const int pines_col_rojo[NUM_COLUMNAS] = {
+    COL_ROJO_0_1, COL_ROJO_2_3, COL_ROJO_4_5
+};
+static const int pines_col_verde[NUM_COLUMNAS] = {
+    COL_VERDE_0_1, COL_VERDE_2_3, COL_VERDE_4_5
+};
+
+static volatile int columna_actual = 0;
+
+static void IRAM_ATTR isr_multiplexado(void *arg) {
+    for (int fila = 0; fila < 6; fila++) {
+        gpio_set_level(pines_filas[fila], 0);
+    }
+
+    gpio_set_level(pines_col_rojo[columna_actual],  0);
+    gpio_set_level(pines_col_verde[columna_actual], 0);
+
+    columna_actual = (columna_actual + 1) % NUM_COLUMNAS;
+
+    uint8_t bits_rojo  = frame_rojo[columna_actual];
+    uint8_t bits_verde = frame_verde[columna_actual];
+
+    static bool fase = false;
+    fase = !fase;
+
+    if (fase) {
+        for (int fila = 0; fila < 6; fila++) {
+            if ((bits_rojo >> fila) & 1) {
+                gpio_set_level(pines_filas[fila], 1);
+            }
+        }
+        gpio_set_level(pines_col_rojo[columna_actual], 1);
+    }
+    else {
+        for (int fila = 0; fila < 6; fila++) {
+            if ((bits_verde >> fila) & 1) {
+                gpio_set_level(pines_filas[fila], 1);
+            }
+        }
+        gpio_set_level(pines_col_verde[columna_actual], 1);
+    }
+}
+
+static void matriz_init(void) {
+    for (int i = 0; i < 6; i++) {
+        gpio_set_direction(pines_filas[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(pines_filas[i], 0);
+    }
+
+    for (int i = 0; i < NUM_COLUMNAS; i++) {
+        gpio_set_direction(pines_col_rojo[i],  GPIO_MODE_OUTPUT);
+        gpio_set_direction(pines_col_verde[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(pines_col_rojo[i],  0);
+        gpio_set_level(pines_col_verde[i], 0);
+    }
+
+    memset((void *)frame_rojo,  0, sizeof(frame_rojo));
+    memset((void *)frame_verde, 0, sizeof(frame_verde));
+
+    const esp_timer_create_args_t timer_cfg = {
+        .callback        = isr_multiplexado,
+        .arg             = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "matriz",
+    };
+    esp_timer_handle_t timer;
+    esp_timer_create(&timer_cfg, &timer);
+    esp_timer_start_periodic(timer, 1000000 / REFRESH_HZ);
+}
+
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void matriz_apagar(void) {
+    portENTER_CRITICAL(&mux);
+    memset((void *)frame_rojo,  0, sizeof(frame_rojo));
+    memset((void *)frame_verde, 0, sizeof(frame_verde));
+    portEXIT_CRITICAL(&mux);
+}
+
+static void matriz_set_casilla(int casilla, Jugador jugador, bool encender) {
+    int col_par  = casilla % 3;
+    int fila_ini = (casilla / 3) * 2;
+
+    uint8_t mascara = (1 << fila_ini) | (1 << (fila_ini + 1));
+
+    portENTER_CRITICAL(&mux);
+
+    if (jugador == ROJO) {
+        if (encender) frame_rojo[col_par]  |=  mascara;
+        else          frame_rojo[col_par]  &= ~mascara;
+    } else {
+        if (encender) frame_verde[col_par] |=  mascara;
+        else          frame_verde[col_par] &= ~mascara;
+    }
+
+    portEXIT_CRITICAL(&mux);
+}
+
+static const int LINEAS_GANADORAS[8][3] = {
+    {0, 1, 2},
+    {3, 4, 5},
+    {6, 7, 8},
+    {0, 3, 6},
+    {1, 4, 7},
+    {2, 5, 8},
+    {0, 4, 8},
+    {2, 4, 6},
+};
+
+static Jugador verificar_ganador(const Juego *j) {
+    for (int i = 0; i < 8; i++) {
+        int a = LINEAS_GANADORAS[i][0];
+        int b = LINEAS_GANADORAS[i][1];
+        int c = LINEAS_GANADORAS[i][2];
+
+        if (j->tablero[a] != VACIA &&
+            j->tablero[a] == j->tablero[b] &&
+            j->tablero[b] == j->tablero[c]) {
+            return j->tablero[a];
+        }
+    }
+    return VACIA;
+}
+
+static bool tablero_lleno(const Juego *j) {
+    for (int i = 0; i < 9; i++) {
+        if (j->tablero[i] == VACIA) return false;
+    }
+    return true;
+}
+
+static void dibujar(const Juego *j) {
+    matriz_apagar();
+
+    if (j->estado == VICTORIA) {
+        if (j->cursor_visible) {
+            for (int casilla = 0; casilla < 9; casilla++) {
+                matriz_set_casilla(casilla, j->ganador, true);
+            }
+        }
+        return;
+    }
+
+    for (int casilla = 0; casilla < 9; casilla++) {
+        if (j->tablero[casilla] == VACIA) continue;
+        matriz_set_casilla(casilla, j->tablero[casilla], true);
+    }
+
+    if (j->estado == JUGANDO &&
+        j->cursor_visible &&
+        j->tablero[j->cursor] == VACIA) {
+        matriz_set_casilla(j->cursor, j->turno, true);
+    }
+}
+
+static void juego_init(Juego *j) {
+    memset(j, 0, sizeof(Juego));
+    j->turno          = ROJO;
+    j->cursor         = 4;
+    j->estado         = JUGANDO;
+    j->cursor_visible = true;
+}
+
+static void juego_avanzar_cursor(Juego *j) {
+    if (j->estado != JUGANDO) return;
+
+    for (int i = 1; i <= 9; i++) {
+        int siguiente = (j->cursor + i) % 9;
+        if (j->tablero[siguiente] == VACIA) {
+            j->cursor = siguiente;
+            break;
+        }
+    }
+
+    j->cursor_visible = true;
+    j->ticks_parpadeo = 0;
+    dibujar(j);
+}
+
+static void juego_confirmar(Juego *j) {
+    if (j->estado != JUGANDO) return;
+    if (j->tablero[j->cursor] != VACIA) return;
+
+    j->tablero[j->cursor] = j->turno;
+
+    Jugador ganador = verificar_ganador(j);
+    if (ganador != VACIA) {
+        j->estado          = VICTORIA;
+        j->ganador         = ganador;
+        j->cursor_visible  = true;
+        j->ticks_animacion = 0;
+        ESP_LOGI(TAG, "Gano jugador %d", ganador);
+    }
+    else if (tablero_lleno(j)) {
+        j->estado = EMPATE;
+        ESP_LOGI(TAG, "Empate");
+    }
+    else {
+        j->turno = (j->turno == ROJO) ? VERDE : ROJO;
+
+        for (int i = 1; i <= 9; i++) {
+            int siguiente = (j->cursor + i) % 9;
+            if (j->tablero[siguiente] == VACIA) {
+                j->cursor = siguiente;
+                break;
+            }
+        }
+        j->cursor_visible = true;
+        j->ticks_parpadeo = 0;
+    }
+
+    dibujar(j);
+}
+
+static void juego_tick(Juego *j) {
+    if (j->estado == JUGANDO) {
+        j->ticks_parpadeo++;
+        if (j->ticks_parpadeo >= TICKS_PARPADEO) {
+            j->ticks_parpadeo = 0;
+            j->cursor_visible = !j->cursor_visible;
+        }
+        dibujar(j);
+    }
+    else if (j->estado == VICTORIA) {
+        j->ticks_parpadeo++;
+        j->ticks_animacion++;
+        if (j->ticks_parpadeo >= TICKS_PARPADEO) {
+            j->ticks_parpadeo = 0;
+            j->cursor_visible = !j->cursor_visible;
+        }
+        dibujar(j);
+    }
+}
+
+static void IRAM_ATTR isr_boton(void *arg) {
+    Boton *boton = (Boton *)arg;
+    uint32_t ahora = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
+
+    if (ahora - boton->ultimo_ms < DEBOUNCE_MS) return;
+
+    boton->ultimo_ms = ahora;
+    EventoBoton evento = boton->evento;
+    xQueueSendFromISR(cola_botones, &evento, NULL);
+}
+
+static void botones_init(void) {
+    int n = sizeof(botones) / sizeof(botones[0]);
+    for (int i = 0; i < n; i++) {
+        gpio_set_direction(botones[i].gpio, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(botones[i].gpio, GPIO_PULLUP_ONLY);
+        gpio_set_intr_type(botones[i].gpio, GPIO_INTR_NEGEDGE);
+        gpio_isr_handler_add(botones[i].gpio, isr_boton, &botones[i]);
+    }
+}
+
+static void task_juego(void *arg) {
+    Juego juego;
+    juego_init(&juego);
+    dibujar(&juego);
+
+    const TickType_t periodo   = pdMS_TO_TICKS(125);
+    TickType_t ultimo_tick     = xTaskGetTickCount();
+
+    EventoBoton evento;
+
+    while (1) {
+        while (xQueueReceive(cola_botones, &evento, 0) == pdTRUE) {
+            if (juego.estado == JUGANDO) {
+                if (evento == EVENTO_AVANZAR)   juego_avanzar_cursor(&juego);
+                if (evento == EVENTO_CONFIRMAR) juego_confirmar(&juego);
+            }
+        }
+
+        juego_tick(&juego);
+
+        if (juego.estado == VICTORIA &&
+            juego.ticks_animacion >= TICKS_ANIMACION) {
+            matriz_apagar();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            juego_init(&juego);
+            dibujar(&juego);
+        }
+
+        if (juego.estado == EMPATE) {
+            matriz_apagar();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            juego_init(&juego);
+            dibujar(&juego);
+        }
+
+        vTaskDelayUntil(&ultimo_tick, periodo);
+    }
+}
+
+void app_main(void) {
+    cola_botones = xQueueCreate(10, sizeof(EventoBoton));
+    gpio_install_isr_service(0);
+
+    matriz_init();
+    botones_init();
+
+    ESP_LOGI(TAG, "Tic-Tac-Toe listo");
+
+    xTaskCreate(task_juego, "juego", 4096, NULL, 5, NULL);
+}
